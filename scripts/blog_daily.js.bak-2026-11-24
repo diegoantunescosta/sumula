@@ -1,0 +1,76 @@
+#!/usr/bin/env node
+'use strict';
+// Roda no host: a autenticação do Codex nunca entra na imagem ou no app público.
+const fs=require('node:fs');
+const os=require('node:os');
+const path=require('node:path');
+const {spawn,execFileSync}=require('node:child_process');
+const ROOT=path.resolve(__dirname,'..');
+function cli(command,input,extra=[]){
+ return JSON.parse(execFileSync('docker',['compose','exec','-T','api','node','src/blog_cli.js',command,...extra],{
+  cwd:ROOT,input:input?JSON.stringify(input):undefined,encoding:'utf8',timeout:180000,maxBuffer:1024*1024,stdio:['pipe','pipe','pipe'],
+ }));
+}
+function findCodex(){
+ if(process.env.CODEX_BIN&&fs.existsSync(process.env.CODEX_BIN))return process.env.CODEX_BIN;
+ try{return execFileSync('which',['codex'],{encoding:'utf8'}).trim();}catch{}
+ const extensions=path.join(os.homedir(),'.vscode-server/extensions');
+ for(const entry of fs.readdirSync(extensions).filter(n=>n.startsWith('openai.chatgpt-')).sort().reverse()){
+  const candidate=path.join(extensions,entry,'bin/linux-x86_64/codex');if(fs.existsSync(candidate))return candidate;
+ }
+ throw new Error('Codex CLI não encontrado. Configure CODEX_BIN e autentique com codex login.');
+}
+// Geração via OpenRouter (modelo gratuito "openrouter/free"); a chave fica no .env da Súmula, fora do git.
+function openRouterKey(){
+ if(process.env.OPENROUTER_API_KEY)return process.env.OPENROUTER_API_KEY;
+ const env=fs.readFileSync(path.join(ROOT,'.env'),'utf8');
+ const m=env.match(/^OPENROUTER_API_KEY=(.*)$/m);
+ if(!m)throw new Error('OPENROUTER_API_KEY ausente no .env');
+ return m[1].trim().replace(/^["']|["']$/g,'');
+}
+function extractJson(raw,name){
+ try{return JSON.parse(raw);}catch{}
+ const fenced=raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+ if(fenced){try{return JSON.parse(fenced[1]);}catch{}}
+ const a=raw.indexOf('{'),b=raw.lastIndexOf('}');
+ if(a>=0&&b>a){try{return JSON.parse(raw.slice(a,b+1));}catch{}}
+ throw new Error(`Etapa ${name} não retornou JSON válido.`);
+}
+async function generate(_bin,dir,name,prompt,schema){
+ const schemaText=fs.readFileSync(path.join(ROOT,'editorial',schema),'utf8');
+ const res=await fetch('https://openrouter.ai/api/v1/chat/completions',{
+  method:'POST',
+  headers:{Authorization:`Bearer ${openRouterKey()}`,'Content-Type':'application/json','X-Title':'Sumula Online'},
+  body:JSON.stringify({model:'openrouter/free',temperature:0.6,
+   messages:[{role:'user',content:prompt+'\n\nResponda SOMENTE com um objeto JSON válido, sem markdown, que siga este JSON Schema:\n'+schemaText}]}),
+  signal:AbortSignal.timeout(12*60000),
+ });
+ if(!res.ok)throw new Error(`Etapa ${name} falhou (OpenRouter HTTP ${res.status}).`);
+ const json=await res.json();
+ const text=json?.choices?.[0]?.message?.content||'';
+ const out=extractJson(text,name);
+ fs.writeFileSync(path.join(dir,name+'.json'),JSON.stringify(out));
+ return out;
+}
+async function main(){
+ if(process.argv.includes('--status')){console.log(JSON.stringify(cli('status'),null,2));return;}
+ const claim=cli('claim',null,process.argv.includes('--force')?['--force']:[]);
+ if(claim.skip){console.log(JSON.stringify({time:new Date().toISOString(),...claim}));return;}
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'sumula-editorial-'));fs.chmodSync(dir,0o700);
+ try{
+  const bin=null;
+  const context=`\n\nData editorial em Brasília: ${claim.day}. Modalidade-foco de hoje (use exatamente este valor em "category", salvo se só houver conteúdo oficial relevante em outra modalidade do sistema): ${claim.focus||'volei'}. Pesquise notícias reais próximas desta data; não invente acontecimentos futuros. Evite pautas, palavras-chave principais e fontes já usadas:\n${JSON.stringify(claim.recent)}\n`;
+  const candidateIndex=process.argv.indexOf('--candidate');
+  const post=candidateIndex>=0?JSON.parse(fs.readFileSync(process.argv[candidateIndex+1],'utf8')):
+   await generate(bin,dir,'writer',fs.readFileSync(path.join(ROOT,'editorial/writer.md'),'utf8')+context,'post.schema.json');
+  const review=await generate(bin,dir,'review',fs.readFileSync(path.join(ROOT,'editorial/reviewer.md'),'utf8')+
+   `\nData editorial: ${claim.day}.\nArtigo a conferir:\n${JSON.stringify(post)}`,'review.schema.json');
+  if(review.approved!==true||!Array.isArray(review.issues)||review.issues.length)throw new Error('Revisão editorial recusada: '+(review.issues||[]).join(' ').slice(0,450));
+  const result=cli('publish',{day:claim.day,token:claim.token,post});
+  console.log(JSON.stringify({time:new Date().toISOString(),published:true,...result}));
+ }catch(e){
+  const message=String(e.message).replace(/(?:sk|rk)_(?:live|test)_[A-Za-z0-9]+/g,'[credencial omitida]').slice(0,600);
+  cli('fail',{day:claim.day,token:claim.token,error:message});throw new Error(message);
+ }finally{fs.rmSync(dir,{recursive:true,force:true});}
+}
+main().catch(e=>{console.error(new Date().toISOString(),e.message);process.exitCode=1;});
